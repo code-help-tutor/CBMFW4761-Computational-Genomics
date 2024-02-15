@@ -1,0 +1,119 @@
+---
+title: "2021-10-18 TEP Data Normalization"
+output: html_notebook
+---
+
+```{r}
+# install required CRAN packages
+for (pkg in c("BiocManager", "data.table", "httr", "FactoMineR", "dendextend", "googledrive")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# install required Bioc packages
+for (pkg in c("limma", "edgeR")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+```
+
+## Load data
+
+```{r}
+library(data.table)
+
+DATA <- "data"
+count_file_path <- "GSE68086_TEP_data_matrix.txt.gz"
+meta_file_path <- "tep_gse68086_meta.txt"
+
+rc <- data.frame(fread(file.path(DATA, count_file_path)),
+                 row.names = 1, check.names = FALSE)
+meta <- read.table(file.path(DATA, meta_file_path),
+                   sep = "\t", check.names = FALSE,
+                   row.names=1, stringsAsFactors = FALSE, header = TRUE)
+rc <- rc[, rownames(meta)]
+```
+
+## Preprocessing
+
+```{r}
+library(edgeR)
+
+dgelist <- DGEList(
+  counts = rc,
+  group = meta$cancer_type,
+  remove.zeros = TRUE,
+  samples = meta,
+  genes = rownames(rc)
+)
+
+design <- model.matrix(~ 0 + cancer_type, data=meta)
+keep <- filterByExpr(dgelist, design=design)
+dgelist <- dgelist[keep,,keep.lib.sizes=FALSE]
+dgelist <- calcNormFactors(dgelist, method="TMM")
+dgelist <- estimateDisp(dgelist, design)
+
+plotBCV(dgelist)
+```
+
+## Visualize batch effect
+
+```{r}
+library(RColorBrewer)
+
+cols <- brewer.pal(n = length(unique(meta$batch)), name = "Dark2")
+names(cols) <- unique(meta$batch)
+sample_colors <- cols[meta$batch]
+
+labels <- substr(meta$batch, 6, 7)
+plotMDS(dgelist,
+        labels = labels,
+        col=sample_colors)
+
+```
+The second dimension separate batch 5 and 6 from the other batches. Therefore, we should try to perform batch correction in order to remove the batch effects.
+
+## Batch correction
+
+We'll use the `removeBatchEffect` function from `limma` package. Ideally, the input to this function should be close to normal distribution. Therefore, we'll use the `voom` function to normalize the values. Voom fit the distribution of the raw counts and map them to the closest quantile values of a normal distribution.
+
+```{r}
+ge <- cpm(dgelist, log=TRUE)
+ge <- removeBatchEffect(ge, batch=meta$batch, design=design)
+
+plotMDS(ge,
+        labels = labels,
+        col=sample_colors)
+```
+
+The MDS plot looks better now. We now convert the Ensembl gene IDs to gene symbol and write the file.
+
+```{r}
+library(httr)
+
+GENE_SYM_ID_LINK_BASE <- "https://www.genenames.org/cgi-bin/download/custom?col=gd_app_sym&col=gd_pub_eg_id&col=gd_pub_ensembl_id&status=Approved&hgnc_dbtag=on&order_by=gd_app_sym_sort&format=text&submit=submit"
+response <- GET(GENE_SYM_ID_LINK_BASE)
+gene_sym_id <- data.frame(fread(text=httr::content(response, "parsed"), header=TRUE))
+colnames(gene_sym_id) <- c("gene_symbol", "gene_id", "ensg")
+
+gene_sym_id <- gene_sym_id[apply(gene_sym_id == "", 1, sum) == 0,]
+gene_sym_id <- gene_sym_id[apply(is.na(gene_sym_id), 1, sum) == 0,]
+gene_sym_id <- gene_sym_id[!duplicated(gene_sym_id$ensg), ]
+```
+
+```{r}
+rownames(gene_sym_id) <- gene_sym_id$ensg
+common_genes <- intersect(gene_sym_id$ensg, rownames(ge))
+ge <- ge[common_genes,]
+rownames(ge) <- gene_sym_id[rownames(ge), "gene_symbol"]
+```
+
+
+```{r}
+write.table(round(ge, 4), file="tep_gse68086_voom.txt",
+            sep="\t", col.names = NA, quote = FALSE)
+```
+
+

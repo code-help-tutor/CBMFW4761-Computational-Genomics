@@ -1,0 +1,328 @@
+---
+title: "RNASeq Data Normalization, Visualization and Differential Expression Analysis"
+output: html_notebook
+---
+
+
+```{r}
+# install required CRAN packages
+for (pkg in c("BiocManager", "data.table", "httr", "dendextend", "googledrive")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# install required Bioc packages
+for (pkg in c("limma", "edgeR", "GO.db", "org.Hs.eg.db","ReactomePA")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+```
+
+## RNASeq exploratory data analysis
+
+### Linear transformation using voom
+
+Exploratory data analysis, or EDA, is the first thing a data scientist does when he / she gets his hands on the data. It's the ice-breaker with your data. Understanding the distribution of the features, the variation in different samples, and try to see if there is any issue with quality by identifying outliers.
+
+Normally to perform EDA, we would do some simple unsupervised learning such as clustering or dimension reduction. These methods generally requires the data to be normally distributed. Unfortunately the RNASeq data is NOT normally distributed by nature. Therefore some transformation is required for us to perform such analysis. This is also essential later when we try to apply supervised learning methods to build predictive models.
+
+One of the RNASeq analysis libraries that's becoming more and more popular is [edgeR](https://bioconductor.org/packages/release/bioc/html/edgeR.html). Due to its well-maintenance and documentation, it has become one of the preferable choice for RNASeq exploration and analysis packages. It allows you to perform exploratory data analysis (EDA) and differential expression analysis in one go. Within its [documentation](https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf) it also covers most of the experiment designs that you will likely encounter in real life. 
+
+Here we will demonstrate how to perform voom transformation using the TCGA colon adenocarcinoma (COAD) data set. It contains RNASeq profiling data from colon cancer tumors of 449 patients, among which 41 samples also have RNASeq profiling of adjecent normal tissues.
+
+The raw count data can be downloaded from the [TCGA GDC portal](https://portal.gdc.cancer.gov/). I have downloaded and create a count table which you can downloaded from here:
+
+[coad_tcga_counts.txt](https://drive.google.com/file/d/1tov1hQH16R4lE9VaCD69vMAt8RygMwBd/view?usp=sharing)
+
+You can download the file and put it to a local file path.
+
+
+We can easily load the count table using the `fread` function from `data.table` package. You'll notice how fast it is compared with loading it using the R native `read.table` function. 
+
+```{r}
+library(data.table)
+# change the file path to where you download the count table
+DATA <- "data"
+count_file_path <- "coad_tcga_counts.txt"
+# load the count table, set check.names to FALSE so R doesn't rename your columns!
+rc <- data.frame(fread(file.path(DATA, count_file_path)), row.names=1, check.names = FALSE)
+dim(rc)
+```
+
+There are 505 samples in the data sets. Since later we would like to focus on comparing the tumor samples with normal samples, it would be 
+
+### Build a DGEList object
+
+In R's analysis pipeline philosophy, all the information should be wrapped by one object for follow-up processes. In RNASeq analysis using `voom` and `edgeR` (the package we'll be using for differential expression analysis later), this object is called a `DGEList`. It contains a few major parameters:
+
+* `counts`: the raw counts
+* `group`: the main experiment factors (e.g. tumor vs normal, treatment vs control)
+* `samples`: a data frame containing information for each sample
+* `genes`: a vector containing information of each gene
+
+
+```{r}
+library(edgeR)
+dgelist <- DGEList(rc, remove.zeros = T, genes=rownames(rc))
+
+dgelist$samples
+```
+
+Note we also set `remove.zeros` to `TRUE` to remove the genes with all zero counts.
+
+
+### Add sample information
+
+In order to perform the analysis, we need to provide more information on the samples. In this case, we'll create a data frame with a few columns:
+
+* `tumor`: whether this sample is a tumor or normal sample, according to the 14th character of the sample ID -- `0` for tumor, normal otherwise.
+* `patient_id`: the patient ID where the sample was taken. This is the first 12 characters of the sample ID
+
+We will create this data frame and add it to the DGEList we just created
+
+```{r}
+sample_meta <- data.frame(tumor=substr(colnames(rc), 14, 14) == "0",
+                          patient_id=substr(colnames(rc), 1, 12),
+                          stringsAsFactors = FALSE, check.names = FALSE)
+rownames(sample_meta) <- colnames(rc)
+
+# re-create the DGEList object
+dgelist <- DGEList(rc, group=sample_meta$tumor, remove.zeros = T,
+                   samples=sample_meta, genes=rownames(rc))
+
+dgelist$samples
+```
+
+### Create design matrix
+
+A [design matrix](https://en.wikipedia.org/wiki/Design_matrix) is a matrix encoding the experimental design in the samples. In our case, it's the tumor / normal difference. You should also put in the important covariates that's relevant to your samples such as tissue type or patient source. 
+
+Note ideally you may also want to control for patient source as an additional covariate. However as we will see later, the difference between tumor and normal is much obvious compared with patient-wide difference.
+
+The design matrix can be done easily using the `model.matrix` function. 
+
+```{r}
+design <- model.matrix(~ tumor, data=sample_meta)
+head(design)
+```
+
+From the design matrix we see that by default the coefficient of the `tumor` term in the model represent the bias added to the estimated expression when the sample is a tumor (`tumorTRUE`). Hence when we see the coefficient is positive, meaning the expression is higher in the tumor samples.
+
+### Remove low-expression genes
+
+The first preprocessing step is to remove low-expressed genes. Genes with very low counts across samples generally provide minimal information, and it tends to distort the distribution of the expression profiles thus causes bias in variance and dispersion estimation. `EdgeR` provides a `filterByExpr` function to remove low-expressed genes. By default it removes genes that have count-per-million (CPM) below 15 (as defined in `min.count`) in the smallest group sample size.
+
+```{r}
+keep <- filterByExpr(dgelist, design=design)
+dgelist <- dgelist[keep,,keep.lib.sizes=FALSE]
+
+dim(dgelist)
+```
+
+### Estimate library size factor
+
+As mentioned, library size is one of the main factor contributing to the read count difference. We will calculate the size factor by each sample and feed it into the normalization function. The easiest way to calculate size factor is just to calculate the total read counts for each sample. We'll use the [calcNormFactors](https://www.rdocumentation.org/packages/edgeR/versions/3.14.0/topics/calcNormFactors) function in the `edgeR` package.
+
+```{r}
+# calculate normalizing factors correct for library size
+# The method TMM stands for `trimmed mean of M-values`, which removes the 
+# highly- and lowly-expressed genes from library size estimation, in order to
+# exclude the differentially expressed
+dgelist <- calcNormFactors(dgelist, method="TMM")
+head(dgelist$samples)
+```
+
+
+
+### Estimate dispersion
+
+As mentioned in the lecture, we have to model the variance of the raw count we obtained using [negative binomial distribution](https://en.wikipedia.org/wiki/Negative_binomial_distribution), while accounting for the design factors and covariates. One of the key steps for analyzing RNASeq data is estimate the dispersion, which is a main contributor to the variations between samples we see in the RNASeq counts. This is done using the `estimateDisp` function with the design matrix as an input, in order to account for the true differences between groups.
+
+```{r}
+dgelist <- estimateDisp(dgelist, design)
+plotBCV(dgelist)
+```
+
+### Exploratory data analysis: MDS
+
+There are several items we can check in an exploratory data analysis in a gene expression data. We can first look at the projections of dimension-reduced gene expression profiles of the samples. One of such dimension-reduction techniques is [multidimensional scaling](https://en.wikipedia.org/wiki/Multidimensional_scaling), or MDS. Unlike many dimension reduction algorithms such as principle component analysis (PCA), it focuses on keeping the distances between samples in the original space being well kept. Therefore it is well-suited for a quick visualization prior to differential expression analysis. MDS can be easily done in `edgeR` using the `plotMDS` function.
+
+Now, as later we would like to perform differential expression between tumor samples and normal samples, from now on we will only include paired samples from the same patients with both tumor and normal. This will give us a more clear signal in the differential expression and remove most of the biological variations. Let's identify the paired samples in our data set and reconstruct a `DGEList` and design matrix.
+
+```{r}
+# Count how many samples each patient has, and keep only samples from patients
+# with more than one sample
+normal_sample_patients <- sample_meta[!sample_meta$tumor, "patient_id"]
+sample_meta_paired <- sample_meta[
+  sample_meta$patient_id %in% normal_sample_patients, 
+]
+sample_count <- aggregate(tumor ~ patient_id,
+                          data=sample_meta_paired, FUN=length)
+paired_patient_id <- sample_count[sample_count$tumor == 2, "patient_id"]
+sample_meta_paired <- sample_meta_paired[
+  sample_meta_paired$patient_id %in% paired_patient_id,]
+
+rc_paired <- rc[, rownames(sample_meta_paired)]
+```
+
+
+```{r}
+dgelist_paired <- DGEList(
+  counts = rc_paired,
+  group = sample_meta_paired$tumor,
+  remove.zeros = TRUE,
+  samples = sample_meta_paired,
+  genes = rownames(rc_paired)
+)
+
+design_paired <- model.matrix(~ tumor,
+                              data=sample_meta_paired)
+keep <- filterByExpr(dgelist_paired, design=design_paired)
+dgelist_paired <- dgelist_paired[keep,,keep.lib.sizes=FALSE]
+dgelist_paired <- calcNormFactors(dgelist_paired, method="TMM")
+dgelist_paired <- estimateDisp(dgelist_paired, design_paired)
+
+sample_colors <- ifelse(dgelist_paired$samples$tumor, "maroon", "navy")
+plotMDS(dgelist_paired,
+        labels = ifelse(dgelist_paired$samples$tumor, "t", "n"), 
+        col=sample_colors)
+```
+
+We can see that the first dimension clearly separates the normal samples from the tumor samples. This indicates the major differences between the samples lie in its tumor status, instead of coming from difference among patients.
+
+### Exploratory data analysis: Clustering
+
+Besides MDS, we can also perform unsupervised clustering to identify the clusters in the data set in a hierarchical way. Per `edgeR`'s recommendation, the best input values for clustering or heatmap analysis is to use the moderated log-counts-per-million (logcpm) with the `cpm` function. Note this normalization only adjusted for the library size but not the **gene lengths**, which means the CPM values is only comparable for **one gene between samples**, but **not comparable in one sample between genes**.
+
+```{r}
+logcpm <- cpm(dgelist_paired, log=TRUE)
+
+logcpm[1:5, 1:5]
+```
+
+We can cluster the samples using simple `hclust` function with `dist` function calculating Euclidean distances.
+
+```{r}
+library(dendextend)
+res <- hclust(dist(t(logcpm)), method="average")
+# export the dendrogram so we can color it
+dend <- as.dendrogram(res)
+labels_colors(dend) <- sample_colors[order.dendrogram(dend)]
+plot(dend, cex=0.5)
+```
+
+Although it's all crowded (note we are plotting 100 samples together). You can still see the normal samples all clustered together apart from the tumor samples.
+
+
+## RNA-Seq Differential Gene Expression Analysis
+
+We have seen the obvious difference in gene expression profiles between the cancer and normal samples in the TCGA colon data set. Now let's try to identify which genes expression level are most significantly different between cancer and normal. 
+
+As mentioned in the lecture, we have to model the variance of the raw count we obtained using [negative binomial distribution](https://en.wikipedia.org/wiki/Negative_binomial_distribution), while accounting for the design factors and covariates. This is done by fitting a generalized linear model (GLM) to the observed data and estimate the parameters. In `edgeR`, there is an advanced version of GLM, called `glmQLFit` function, that uses [quasi-likelihood](https://en.wikipedia.org/wiki/Quasi-likelihood) method to account for gene-specific variability from both biological and technical sources. You can refer to its [source paper](https://doi.org/10.1515/1544-6115.1826) or the [edgeR document](https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf) for details. If you just want to get things done, simply call `glmQLFit`.
+
+```{r}
+fit <- glmQLFit(dgelist_paired, design_paired)
+plotQLDisp(fit)
+```
+
+Once the model fit is done, to obtain which genes have significantly different expression levels in tumor vs normal, we can compare the fitted coefficients of the `tumor` in our design matrix. If there is indeed a significant difference between tumor and normal, the model including the tumor status as a coefficient should have a significantly better fit than the one without. In statistics, this test is called a [likelihood-ratio test](https://en.wikipedia.org/wiki/Likelihood-ratio_test), comparing the fitted coefficients of the two categories. Under the quasi-likelihood model, this test is called a [quasi-likelihood F test](https://doi.org/10.1515/1544-6115.1826), implemented by `glmQLFTest` function. 
+
+Note that since we did not fit the intercept of the model (_i.e._ we used `~ 0 + tumor`), we have to specifically assign the `contrast` parameter to compare the groups. In this case we want to compare `tumorTRUE - tumorFALSE`, thus we assign a contract parameter of `c(-1, 1)` corresponding to the two columns of design matrix. If you used `coef = "tumorTRUE"` instead of `contract` you will find all genes to be significant, since it basically just checks whether the fit of `tumorTRUE` coefficient is significant. 
+
+
+```{r}
+qlf <- glmQLFTest(fit)
+```
+
+```
+As an alternative analysis, you may try to include `patient_id` into your design matrix, namely `~ 0 + tumor + patient_id`. This will ask the model to create one coefficient per patient, and thus take into consideration the patient-specific expression level. However, this will significantly increase the fitting time. Besides, as we have seen in the MDS plot, there is no obvious patient-specific effect in the samples. Therefore, for a simplified model, we can ignore `patient_id`.
+```
+
+To look at the top differentially expressed genes, use the `topTags` function to output a table.
+
+```{r}
+toptags <- as.data.frame(topTags(qlf, n=Inf))
+toptags
+```
+
+We can visualize the differential expression result by a volcano plot, with log2 fold change (logFC) on the x axis and -log10(PValue) on the y axis.
+
+```{r}
+# set significant genes as red / blue, and none significant genes as gray
+dot_colors <- ifelse((toptags$logFC > 1) & (toptags$FDR < 5e-2),
+                     "maroon",
+                     ifelse((toptags$logFC < -1) & (toptags$FDR < 5e-2), 
+                            "navy", "gray"))
+plot(x=toptags$logFC, y=-log10(toptags$FDR), pch=16, col=dot_colors)
+to_annot <- (toptags$FDR < 1e-10) & (abs(toptags$logFC) >5)
+text(x=toptags$logFC[to_annot], y=-log10(toptags$FDR[to_annot]),
+     labels=toptags$genes[to_annot], pos=4)
+```
+
+We can also visualize the expression values back using the log2cpm data. 
+
+```{r}
+boxplot(logcpm["AJUBA", colnames(rc_paired)] ~ sample_meta_paired$tumor, outpch=NA,
+        col="dodgerblue4", xlab="tumor", ylab="AJUBA log2CPM")
+stripchart(logcpm["AJUBA", colnames(rc_paired)] ~ sample_meta_paired$tumor,
+           vertical = TRUE, method = "jitter", pch = 16, col = "black", add = TRUE) 
+```
+
+Trying to make biological interpretation on single gene result is usually difficult. Therefore, we usually map the differentially expressed genes to the **pathway** level, to identify biological pathways that has been enriched with over-expressed or under-expressed genes. A convenient tool for such analysis is also included in `edgeR`. Given your significant gene list, you can call `goana` to look at which pathway from [Gene Ontology](http://geneontology.org/) is enriched with your significant genes; similarly, call `kegga` to look at which pathway from [KEGG](https://www.genome.jp/kegg/pathway.html) is enriched.
+
+One thing before we perform the enrichment analysis. The `goana` and `kegga` function only accept [`Entrez gene ID`](https://bioportal.bioontology.org/ontologies/EDAM?p=classes&conceptid=data_1027) as input. Therefore we will use a mapping table extracted from [HGNC website](https://www.genenames.org/) to convert the gene symbols into gene IDs. This can be done by the code below:
+
+```{r}
+library(httr)
+
+GENE_SYM_ID_LINK_BASE <- "https://www.genenames.org/cgi-bin/download/custom?col=gd_app_sym&col=gd_pub_eg_id&status=Approved&hgnc_dbtag=on&order_by=gd_app_sym_sort&format=text&submit=submit"
+response <- GET(GENE_SYM_ID_LINK_BASE)
+gene_sym_id <- data.frame(fread(text=httr::content(response, "parsed"), header=TRUE))
+colnames(gene_sym_id) <- c("gene_symbol","gene_id")
+
+gene_sym_id <- gene_sym_id[apply(gene_sym_id == "", 1, sum) == 0,]
+gene_sym_id <- gene_sym_id[apply(is.na(gene_sym_id), 1, sum) == 0,]
+
+gene_sym_id <- gene_sym_id[!duplicated(gene_sym_id$gene_id), ]
+rownames(gene_sym_id) <- gene_sym_id$gene_symbol
+```
+
+```{r}
+head(gene_sym_id)
+```
+
+```{r}
+go_res <- goana(qlf, geneid=gene_sym_id[rownames(qlf), "gene_id"])
+
+topGO(go_res)
+```
+
+These GO terms actually didn't give us much. Let's try to use a different pathway enrichment analysis tool: 
+[Reactome Pathway Analysis](https://www.bioconductor.org/packages/release/bioc/html/ReactomePA.html) library runs enrichment analysis on the [REACTOME pathway database](https://reactome.org/). The `enrichPathway` function performs gene set enrichment analysis of Reactome Pathway on provided gene list. It takes the entrez ID as input as well.
+
+Let's run the top 100 genes ranked by P-values with logFC > 1 (2-fold change) on the REACTOME pathway:
+
+```{r}
+
+library(ReactomePA)
+
+top100_genes <- toptags[(toptags$logFC > 1) & (toptags$FDR < 0.05),]$genes[1:100]
+top100_genes_id <- gene_sym_id[top100_genes, "gene_id"]
+ep <- enrichPathway(top100_genes_id, pvalueCutoff = 0.05, readable = TRUE)
+head(ep)
+```
+
+By searching the name of the two enriched pathways, you can identify that [SUMOylation is widely involved in carcinogenesis](https://www.spandidos-publications.com/10.3892/ijo.2018.4280), and [PTEN's role as a tumor suppressor](https://doi.org/10.3390/cancers11111765).
+
+Another resource would be the [MSigDB](https://www.gsea-msigdb.org/). You can concatenate the top 100 up-regulated genes and input that to the [`Investigate Gene Sets`](https://www.gsea-msigdb.org/gsea/msigdb/annotate.jsp) page 
+
+
+```{r}
+# Put this to MSigDB
+paste(toptags[(toptags$logFC > 1) & (toptags$FDR < 0.05),]$genes[1:100],
+      collapse=", ")
+```
+
+You can see we observe the same up-regulated genes as an independent data set from Sabates _et al._, and a early gastric cancer data set by Vecchi _et al._.
